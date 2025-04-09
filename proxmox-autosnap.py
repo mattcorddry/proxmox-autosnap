@@ -42,11 +42,13 @@ def running(func):
     return create_pid
 
 
-def run_command(command: list, force_no_sudo: bool = False) -> dict:
+def run_command(command: list, force_no_sudo: bool = False, shell: bool = False) -> dict:
     if USE_SUDO and not force_no_sudo:
         command.insert(0, 'sudo')
+    if shell:
+        command = ' '.join(command)
 
-    run = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    run = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell)
     out, err = run.communicate()
     if run.returncode == 0:
         return {'status': True, 'message': out.decode('utf-8', 'replace').rstrip()}
@@ -93,8 +95,9 @@ def get_pve_config(vmid: str, virtualization: str) -> dict:
 
     for line in run['message'].splitlines():
         if ':' in line:
-            (k, v) = line.split(': ')
-            cfg[k.strip()] = v.strip()
+            f = line.split(': ', maxsplit=1)
+            if len(f) == 2: 
+                cfg[f[0].strip()] = f[1].strip()
 
     return cfg
 
@@ -289,6 +292,169 @@ def zfs_send(vmid: str, virtualization: str, zfs_send_to: str):
                 else:
                     print('VM {0} - syncoid FAIL: {1}'.format(vmid, run['message']))
 
+# use the 'zfs list -t snapshot' command to find all snapshots for a given zfs volume
+def zfs_list_snapshots(zfs_volume: str) -> list:
+    params = ['/usr/bin/zfs', 'list', '-t', 'snapshot', '-o', 'name', zfs_volume]
+    run = run_command(params)
+    snap_list = []
+    if run['status']:
+        for snap_name in run['message'].splitlines():
+            if snap_name != 'NAME':
+                snap_list.append(snap_name)
+    else:
+        print('  ZFS volume {0} could not list snapshots'.format(zfs_volume))
+        print('  CMD:: ' + ' '.join(params))
+        print(run['message'])
+        return
+
+    return snap_list
+
+# build an ssh command for use in the functions below
+def _ssh_command(ssh_user: str, ssh_options: list) -> list:
+    # build the ssh command base
+    ssh_cmd = ['/usr/bin/ssh', '-oBatchMode=yes']
+    if ssh_user:
+        ssh_cmd.extend(['-l', ssh_user])
+    if ssh_options:
+        for opt in ssh_options:
+            if " " in opt:
+                sub_opt = opt.split(' ')
+                ssh_cmd.extend(sub_opt)
+            else:
+                ssh_cmd.append(opt.strip())
+    return ssh_cmd
+
+# list remote snapshot files
+def ssh_list_remote_snapshots(ssh_user: str, target_hostname: str, target_path: str, ssh_options: list) -> list:
+    # list remote files
+    ssh_cmd = _ssh_command(ssh_user, ssh_options)
+    ls_cmd = ssh_cmd + [target_hostname, 'find', target_path, '-type', 'f']
+    ls_run = run_command(ls_cmd)
+
+    files = []
+    if ls_run['status']:
+        for file in ls_run['message'].splitlines():
+            files.append(file)
+    else:
+        print('  FAILED to list snapshots on {0}:{1} as user {2}'.format(target_hostname, target_path, ssh_user))
+        print('  CMD: ' + ' '.join(ls_cmd))
+        print(ls_run['message'])
+        return
+    
+    return files
+
+# send a zfs snapshot as a file over ssh if it does not already exist on the target
+# takes a target argument in the form of user@hostname:/path
+# takes optional ssh options as a string
+def ssh_send(vmid: str, virtualization: str, ssh_send_to: str, ssh_options: list):
+    cfg = get_pve_config(vmid, virtualization)
+
+    if '@' in ssh_send_to:
+        (ssh_user, target) = ssh_send_to.split('@')
+    else:
+        target = ssh_send_to
+
+    if ':' in target:
+        (target_hostname, target_path) = target.split(':')
+        target_path.rstrip('/')
+    else:
+        target_hostname = target
+        target_path = '~'
+
+    existing_snapshots = ssh_list_remote_snapshots(ssh_user, target_hostname, target_path, ssh_options)
+    ssh_cmd = _ssh_command(ssh_user, ssh_options)
+
+    if os.path.isfile('/usr/bin/pigz'):
+        gz_cmd = '/usr/bin/pigz'
+    else:
+        gz_cmd = '/usr/bin/gzip'
+
+    for k, v in cfg.items():
+        proxmox_vol = v.split(',')[0]
+        if (k == 'rootfs' or
+                (re.fullmatch('mp[0-9]+', k) and ('backup=1' in v)) or
+                (re.fullmatch('(ide|sata|scsi|virtio)[0-9]+', k) and ('backup=0' not in v) and proxmox_vol != 'none' and ('media=cdrom' not in v)) or
+                (re.fullmatch('(efidisk|tpmstate)[0-9]+', k))):
+
+            localzfs = get_zfs_volume(proxmox_vol, virtualization)
+            print('VM {0} - Sending snapshots over ssh for volume {1}::'.format(vmid, localzfs))
+            local_snapshots = zfs_list_snapshots(localzfs)
+            for snap in local_snapshots:
+                target_filename = target_path + '/' + snap + '.zfs.gz'
+                if target_filename in existing_snapshots:
+                    print('  Snapshot {0} already exists on {1}, skipping.'.format(snap, ssh_send_to))
+                    continue
+
+                copy_cmd = ['/usr/bin/zfs', 'send', snap, '|', gz_cmd, '-c', '|'] + ssh_cmd + [target_hostname, 'dd', 'bs=1M', 'of={0}'.format(target_filename)]
+                copy_run = run_command(copy_cmd, shell=True)
+                if copy_run['status']:
+                    print('  Sent snapshot {0} to {1}:{2}'.format(snap, target_hostname, target_filename))
+                else:
+                    print('  FAILED to send snapshot {0} to {1}'.format(snap, target_hostname))
+                    print('  CMD: ' + ' '.join(copy_cmd))
+                    print(copy_run['message'])
+                    return
+
+# prune snapshots that do not exist locally
+def ssh_prune_snapshots(ssh_send_to: str, ssh_options: list):
+    if '@' in ssh_send_to:
+        (ssh_user, target) = ssh_send_to.split('@')
+    else:
+        target = ssh_send_to
+
+    if ':' in target:
+        (target_hostname, target_path) = target.split(':')
+        target_path.rstrip('/')
+    else:
+        target_hostname = target
+        target_path = '~'
+
+    print('Checking for obsolete snapshots in {0}:{1}'.format(target_hostname, target_path))
+    remote_snapshots = ssh_list_remote_snapshots(ssh_user, target_hostname, target_path, ssh_options)
+    ssh_cmd = _ssh_command(ssh_user, ssh_options)
+
+    # list all local snapshots
+    local_snapshots = []
+    snaplist_params = ['/usr/bin/zfs', 'list', '-t', 'snapshot', '-o', 'name']
+    snaplist_run = run_command(snaplist_params)
+    if snaplist_run['status']:
+        for snap in snaplist_run['message'].splitlines():
+            snap.strip()
+            if snap != "NAME":
+                target_filename = target_path + '/' + snap + '.zfs.gz'
+                local_snapshots.append(target_filename)
+    else:
+        print('Failed to list local snapshots')
+        print('CMD: ' + ' '.join(snaplist_params))
+        print(snaplist_run['message'])
+        return
+
+    # find remote snapshots not present on local system
+    prune_snapshots = []
+    for remote_snap in remote_snapshots:
+        if remote_snap not in local_snapshots:
+            prune_snapshots.append(remote_snap)
+
+    # safety checks
+    if ((len(local_snapshots) == 0) or
+            (len(remote_snapshots) == 0) or
+            (len(remote_snapshots) == len(prune_snapshots))):
+        print('Prune SSH snapshots: safety check failed')
+        print('  {0} local snapshots'.format(len(local_snapshots)))
+        print('  {0} remote snapshots'.format(len(remote_snapshots)))
+        print('  {0} prune snapshots'.format(len(prune_snapshots)))
+        return
+
+    for prune_snap in prune_snapshots:
+        prune_cmd = ssh_cmd + [target_hostname, 'rm', '-fv', prune_snap]
+        prune_run = run_command(prune_cmd)
+        if prune_run['status']:
+            print('  {0}:{1}'.format(target_hostname, prune_run['message']))
+        else:
+            print('  FAILED to delete {0}:{1}'.format(target_hostname, prune_snap))
+            print(prune_run['message'])
+
+
 
 @running
 def main():
@@ -311,6 +477,10 @@ def main():
     parser.add_argument('-i', '--includevmstate', action='store_true', help='Include the VM state in snapshots.')
     parser.add_argument('--zfs-send-to', metavar='[USER@]HOST:ZFSDIR',
                         help='Send zfs snapshot to USER@HOST on ZFSDIR hierarchy - USER@ is optional with syncoid > 2:1')
+    parser.add_argument('--ssh-send-to', metavar='[USER@]HOST:PATH',
+                        help='Send zfs snapshot to compressed file on HOST at PATH')
+    parser.add_argument('--ssh-options', nargs='+', help='Additional options for ssh command')
+    parser.add_argument('--ssh-prune', action='store_true', help='Prune obsolete snapshot files on ssh target host once copy is complete')
     parser.add_argument('-d', '--dryrun', action='store_true',
                         help='Do not create or delete snapshots, just print the commands.')
     parser.add_argument('--sudo', action='store_true', help='Launch commands through sudo.')
@@ -348,6 +518,11 @@ def main():
     elif argp.zfs_send_to:
         for k, v in picked_vmid.items():
             zfs_send(vmid=k, virtualization=v, zfs_send_to=argp.zfs_send_to)
+    elif argp.ssh_send_to:
+        for k, v in picked_vmid.items():
+            ssh_send(vmid=k, virtualization=v, ssh_send_to=argp.ssh_send_to, ssh_options=argp.ssh_options)
+        if argp.ssh_prune:
+            ssh_prune_snapshots(ssh_send_to=argp.ssh_send_to, ssh_options=argp.ssh_options)
     else:
         parser.print_help()
 
