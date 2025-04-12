@@ -31,6 +31,9 @@ chmod +x /root/proxmox-autosnap/proxmox-autosnap.py
 | date-truenas-format | no       | bool | false   | Store snapshots in TrueNAS format.                              |
 | sudo                | no       | bool | false   | Launch commands through sudo.                                   |
 | zfs-send-to         | no       | str  | empty   | Send a copy of zfs subvolumes to another host via syncoid       |
+| ssh-send-to         | no       | str  | empty   | Send a copy of zfs snapshots to another host via ssh            |
+| ssh-options         | no       | str  | empty   | Options to pass to the ssh command when using ssh-send-to       |
+| ssh-prune           | no       | bool | false   | Delete file snapshots on the remote host when using ssh-send-to |
 | tags                | no       | list | empty   | Space separated list of tags                                    |
 | exclude-tags        | no       | list | empty   | Space separated list of tags to exclude                         |
 | force               | no       | bool | false   | Force removal from the config, even if snapshot deletion fails. |
@@ -112,6 +115,24 @@ for more information.
 Option should be set to `[user@]host:zfsdir`. All subvolumes of specified VMs
 will be copied to this path, including `rootfs` and `mpX` mount points with
 backup option enabled on Proxmox.
+
+## ssh-send-to
+
+The option `ssh-send-to` sends compressed ZFS snapshots over an ssh pipe,
+writing to a file on the remote filesystem. This is effectively a wrapper for
+`zfs send /path/to/snapshot | pigz -c | ssh user@remotehost dd of=snapshot.zfs.gz`.
+The option `ssh-send-to` supports two additional options: `ssh-options` and
+`ssh-prune`. `ssh-options` allows specification of options sent to the `ssh`
+command, such as alternate credentials. `ssh-prune` enables deletion of
+snapshot files which exist on the remote host but have been deleted from the
+local Proxmox host.
+
+```bash
+# Send zfs snapshots to another host, creating a compressed zfs file on the
+# remote filesystem. This example uses an alternate SSH identity and prunes
+# old files which exist on remote-server but not on localhost.
+proxmox-autosnap.py -v all --ssh-send-to user@remote-server:/path --ssh-options="-i /root/.ssh/vmbackup" --ssh-prune
+```
 
 ## Cron
 
