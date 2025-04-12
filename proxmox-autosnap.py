@@ -95,9 +95,8 @@ def get_pve_config(vmid: str, virtualization: str) -> dict:
 
     for line in run['message'].splitlines():
         if ':' in line:
-            f = line.split(': ', maxsplit=1)
-            if len(f) == 2: 
-                cfg[f[0].strip()] = f[1].strip()
+            (k, v) = line.split(': ')
+            cfg[k.strip()] = v.strip()
 
     return cfg
 
